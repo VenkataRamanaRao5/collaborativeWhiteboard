@@ -14,7 +14,7 @@ const whiteboardJsonFile = __dirname + '/public/whiteboard.json';
 fs.writeFile(whiteboardJsonFile, '', ()=> console.log('Whiteboard JSON file created...'));
 
 // Mongodb connection string
-const mongodbUri = "mongodb+srv://mkp14:hsXMDcZHujEombHL@cluster0.pvuqn.mongodb.net/workingDatabases?retryWrites=true&w=majority";
+const mongodbUri = process.env.MONGO_URI;
 
 
 // Retrieve & send whiteboard state
@@ -33,7 +33,7 @@ if (cluster.isMaster) {
   var redis = require('socket.io-redis');
 
   // Attach redis adapter to master socket instance
-  io.adapter(redis({ host: '127.0.0.1', port: 6379 }));
+  io.adapter(redis(process.env.REDIS_URL));
 
   // Store clients details
   let allClients = new Map();
