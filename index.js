@@ -1,3 +1,7 @@
+// --- 1. Load Environment Variables (Must be at the top) ---
+if (process.env.NODE_ENV !== 'production') {
+    require('dotenv').config();
+}
 
 const cluster = require('cluster'),
       express = require('express'),
@@ -5,17 +9,19 @@ const cluster = require('cluster'),
       fs = require('fs'),
       MongoClient = require('mongodb').MongoClient,
       fabric = require('fabric').fabric,
-      port = process.env.PORT || 8080,
+      // Use the new Redis client for History features
+      { createClient } = require('redis'), 
+      port = process.env.PORT || 8080, // Azure uses process.env.PORT
       numCPUs = require('os').cpus().length,
       printLines = '----------------------------------------------------';
 
-// JSON to store whiteboard state
+// JSON to store whiteboard state (Legacy local file)
 const whiteboardJsonFile = __dirname + '/public/whiteboard.json';
 fs.writeFile(whiteboardJsonFile, '', ()=> console.log('Whiteboard JSON file created...'));
 
-// Mongodb connection string
+// Mongodb connection string (From Azure App Settings)
 const mongodbUri = process.env.MONGO_URI;
-
+const redisUrl = process.env.REDIS_URL;
 
 // Retrieve & send whiteboard state
 var whiteboardContent = fs.readFileSync(whiteboardJsonFile, 'utf-8');
@@ -30,10 +36,11 @@ if (cluster.isMaster) {
   // Build master http server that doesn't listen for port connections 
   var server = require('http').createServer();
   var io = require('socket.io')(server);
-  var redis = require('socket.io-redis');
+  var redisAdapter = require('socket.io-redis');
 
   // Attach redis adapter to master socket instance
-  io.adapter(redis(process.env.REDIS_URL));
+  // Ensure your REDIS_URL is in format: redis://:password@host:port
+  io.adapter(redisAdapter(redisUrl));
 
   // Store clients details
   let allClients = new Map();
@@ -66,11 +73,10 @@ if (cluster.isMaster) {
           // Get leader's whiteboard state
           retrieveWhiteboards(io, leader);
         } else {
-          // Retrieve & send whiteboard state
-          var whiteboardContent = fs.readFileSync(whiteboardJsonFile, 'utf-8');
-
-          // Get leader's whiteboard state
-          io.to(leader).emit('canvas:leader', socketId);
+            // Note: With Redis History Replay added below, 
+            // relying on the leader for the initial state is less critical, 
+            // but we keep it here for your existing save functionality.
+            io.to(leader).emit('canvas:leader', socketId);
           console.log(`\n${printLines}\nMaster Server: Canvas state sent to ${socketId}`);
         }
         // Store socket & username
@@ -98,8 +104,12 @@ if (cluster.isMaster) {
       else if (msg.canvasClear) {
         // Retrieve socket id
         var socketId = msg.canvasClear;
-
+        
+        // CLEAR REDIS HISTORY TOO
+        // We need to signal workers to clear redis, but for now 
+        // we just emit the event. (Ideally, clear 'whiteboard_history' in Redis here)
         io.emit('canvas:clear');
+        
         io.emit('update:history', `${allUsers[socketId]} cleared the whiteboard.`);
         console.log(`\n${printLines}\nMaster Server: '${socketId}' cleared the whiteboard`);
       }
@@ -136,12 +146,14 @@ if (cluster.isMaster) {
 
         // Select initial leader
         if(allClients.size < 2) {
-          leader = Object.keys(allUsers)[0];
+            if(Object.keys(allUsers).length > 0) {
+                 leader = Object.keys(allUsers)[0];
           
           console.log(`\n${printLines}\nMaster Server: ${leader} set as leader`);
 
           // Get leader's whiteboard state & set new leader
-          retrieveWhiteboards(io, leader);
+                 retrieveWhiteboards(io, leader);
+            }
         } else {
           leader = Object.keys(allUsers)[randomNumber];
           console.log(`\n${printLines}\nMaster Server: ${leader} set as leader`);
@@ -170,12 +182,25 @@ if (cluster.isMaster) {
   var app = express();
   var server = require('http').createServer(app);
   var io = require('socket.io')(server);
-  var redis = require('socket.io-redis');
+  var redisAdapter = require('socket.io-redis');
 
-  // Attach Redis adapter to worker socket instance
-  io.adapter(redis({ host: '127.0.0.1', port: 6379 }));
+  // Attach Redis adapter
+  io.adapter(redisAdapter(redisUrl));
 
-  // Listen for activity on port
+  // --- NEW: Dedicated Redis Client for History Replay ---
+  const historyClient = createClient({ url: redisUrl });
+  
+  historyClient.on('error', (err) => console.log('Redis Client Error', err));
+
+  (async () => {
+    try {
+        await historyClient.connect();
+        console.log(`Worker ${process.pid}: Connected to Redis for History`);
+    } catch (e) {
+        console.error(`Worker ${process.pid}: Redis Connection Failed`, e);
+    }
+  })();
+
   server.listen(port, ()=> console.log(`Worker Server ${process.pid}: listening on port ${port}...`));
 
   // set server directory & PORT
@@ -186,16 +211,27 @@ if (cluster.isMaster) {
     response.sendFile(__dirname + '/public/whiteboard.html');
   });
 
-  // Handling socket interactions 
-  io.sockets.on('connection', (socket)=> {
-    // Store connected clients
+  io.sockets.on('connection', async (socket)=> {
     let workerClients = new Map();
     let workerUsers = {};
     var i = 1;
 
     console.log(`Worker Server ${process.pid}: [id=${socket.id}] connected...`);
 
-    // Update state when user joins
+    // --- NEW: REPLAY HISTORY ON CONNECT ---
+    // Immediately send the stored drawing history to the new user
+    try {
+        const history = await historyClient.lRange('whiteboard_history', 0, -1);
+        if(history && history.length > 0) {
+            console.log(`Replaying ${history.length} events to ${socket.id}`);
+            history.forEach(item => {
+                socket.emit('object:added', JSON.parse(item));
+            });
+        }
+    } catch (err) {
+        console.error("Error replaying history:", err);
+    }
+
     socket.on('join', (username)=> {
       // Store client socket & username
       workerClients.set(socket, i);
@@ -209,18 +245,27 @@ if (cluster.isMaster) {
       socket.emit('update:history', `${username} connected to server.`);
     });
 
-    // Object added by client
-    socket.on('object:added', (data)=> socket.broadcast.emit('object:added', data));
+    // --- MODIFIED: Object added by client ---
+    socket.on('object:added', async (data)=> {
+        // 1. Broadcast to everyone else (Standard logic)
+        socket.broadcast.emit('object:added', data);
+
+        // 2. NEW: Save to Redis History
+        try {
+            await historyClient.rPush('whiteboard_history', JSON.stringify(data));
+        } catch (err) {
+            console.error("Failed to save to history:", err);
+        }
+    });
     
-    // Retrieve leader's canvas state
     socket.on('canvas:leader', (data)=> {
       // Store canvas locally
       fs.writeFile(whiteboardJsonFile, data[1], ()=> console.log(`Worker Server ${process.pid}: Leader's whiteboard state saved.`));
 
       // Send leader's canvas state to new client
       io.to(data[0]).emit('canvas:initial', data[1]);
-
-      // Add timestamp to canvas & store on database
+      
+      // Save snapshot to MongoDB
       var savedWhiteboard = JSON.parse(data[1]);
       savedWhiteboard["timestamp"] = moment().format()
       createWhiteboardSave(savedWhiteboard);
@@ -239,10 +284,14 @@ if (cluster.isMaster) {
       io.close();
     });
 
-    // Whiteboard cleared by client
-    socket.on('canvas:clear', ()=> {
-      // Inform master of whiteboard clear
+    socket.on('canvas:clear', async ()=> {
+      // Clear local board
       process.send({ canvasClear: socket.id });
+      
+      // NEW: Clear Redis History
+      try {
+          await historyClient.del('whiteboard_history');
+      } catch(err) { console.error(err); }
     });
 
     // Client disconnects
@@ -265,30 +314,27 @@ if (cluster.isMaster) {
 
 } // End of else
 
+// --- HELPER FUNCTIONS ---
 
-// Function returning the count of keys in an object
 function getUserCount(object){ return Object.keys(object).length; }
 
-// Function returning a random number between min and max
 function getRandomNumber(min, max) { 
   min = Math.ceil(min);
   max = Math.floor(max);
   return Math.floor(Math.random() * (max - min + 1)) + min;
 }
 
-// Function to save whiteboard state to database 
+// Save to MongoDB
 async function createWhiteboardSave(whiteboardState){
-  // Connect to mongoDb
-  const client = await MongoClient.connect(mongodbUri, { useNewUrlParser: true, useUnifiedTopology: true }).catch(err => { console.log(err);});
+  if (!mongodbUri) return; // Guard against missing Env Var
 
-  if(!client) {
-    return; 
-  }
+  const client = await MongoClient.connect(mongodbUri, { useNewUrlParser: true, useUnifiedTopology: true }).catch(err => { console.log(err);});
+  if(!client) return; 
 
   // Store whiteboard on database
   try {
     const result = await client.db("collaborativeWhiteboard").collection("whiteboardStates").insertOne(whiteboardState);
-    console.log(`Whiteboard state stored with the following id: ${result.insertedId}`);
+    console.log(`Whiteboard state stored with id: ${result.insertedId}`);
   } catch (err) {
     console.log(err);
   } finally {
@@ -298,16 +344,14 @@ async function createWhiteboardSave(whiteboardState){
 
 // Function to retrieve saved whiteboard states from database 
 async function retrieveWhiteboards(io, socketId){
-  // Connect to mongoDb
-  const client = await MongoClient.connect(mongodbUri, { useNewUrlParser: true, useUnifiedTopology: true }).catch(err => { console.log(err);});
+  if (!mongodbUri) return;
 
-  if(!client) {
-    return; 
-  }
+  const client = await MongoClient.connect(mongodbUri, { useNewUrlParser: true, useUnifiedTopology: true }).catch(err => { console.log(err);});
+  if(!client) return; 
 
   // Retrieve whiteboard states from database
   try {
-    const cursor = client.db("collaborativeWhiteboard").collection("whiteboardStates").find().limit(5);
+    const cursor = client.db("collaborativeWhiteboard").collection("whiteboardStates").find().sort({_id:-1}).limit(5);
     const result = await cursor.toArray();
 
     // Send saved whiteboards to leader

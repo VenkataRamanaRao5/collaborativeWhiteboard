@@ -29,6 +29,7 @@
   "devDependencies": {
     "@angular/cli": "^11.0.2",
     "bufferutil": "^4.0.2",
+    "dotenv": "^17.2.3",
     "utf-8-validate": "^5.0.3"
   }
 }
