@@ -1,18 +1,14 @@
-FROM node:12
+FROM node:20
 
-# Create app directory
-WORKDIR /
+# Create app directory (Cleaner to use /app)
+WORKDIR /app
 
 # Install app dependencies
 COPY package*.json ./
-
 RUN npm install
-RUN apt-get update
-RUN DEBIAN_FRONTEND=noninteractive apt-get -y install redis-server
-RUN redis-server &
 
 # Bundle app source
-COPY ./ ./
+COPY . .
 
 EXPOSE 8080
 

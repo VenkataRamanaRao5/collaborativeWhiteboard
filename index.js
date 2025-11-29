@@ -1,8 +1,3 @@
-// --- 1. Load Environment Variables (Must be at the top) ---
-if (process.env.NODE_ENV !== 'production') {
-    require('dotenv').config();
-}
-
 const cluster = require('cluster'),
       express = require('express'),
       moment = require('moment'),
