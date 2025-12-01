@@ -2,7 +2,7 @@ moment.locale('en');
 
 (function() {
   // Connect to server socket
-  var socket = io.connect("http://localhost:8080", { transports: [ 'websocket' ], reconnect: true });
+  var socket = io.connect({ transports: [ 'websocket' ], reconnect: true });
 
   // Check connection status
   setTimeout(()=>{ console.log("Connected:" + socket.connected) }, 1000);
